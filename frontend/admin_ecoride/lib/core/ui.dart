@@ -8,7 +8,7 @@ import 'colors.dart';
 /// ต้นแบบ HTML ออกแบบที่ความกว้างหน้าจอ ~250px
 /// ทุกขนาด (ฟอนต์, padding, radius) ถูกคูณด้วยสเกลนี้ เพื่อให้สัดส่วนเหมือนต้นแบบ 1:1 ทุกเครื่อง
 class Ui {
-  static const double designWidth = 250;
+  static const double designWidth = 320;
   static double k = 1.5;
 
   static void init(BuildContext context) {
