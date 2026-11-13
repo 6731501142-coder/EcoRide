@@ -51,6 +51,12 @@ Widget _head(IconData icon, Tint tint, String title, String sub, (String, PillKi
       ], w: 10),
     );
 
+/// เรียกฟังก์ชันของ AppStore (ที่คืนข้อความ error หรือ null) แล้วแจ้ง error ถ้ามี
+Future<void> _run(BuildContext ctx, Future<String?> Function() action) async {
+  final err = await action();
+  if (err != null && ctx.mounted) toast(ctx, err, error: true);
+}
+
 Widget _close(BuildContext ctx) =>
     Btn('Close', kind: BtnKind.outlined, onTap: () => Navigator.of(ctx).pop());
 
@@ -92,18 +98,19 @@ void showReportSheet(BuildContext context, ProblemReport r) {
       ),
       if (r.status == 'open')
         Btn(urgent ? 'Accept · staff on the way' : 'Start working on it',
-            icon: TablerIcons.check, onTap: () => s.setReportStatus(r, 'in_progress')),
+            icon: TablerIcons.check, onTap: () => _run(ctx, () => s.setReportStatus(r, 'in_progress'))),
       if (r.status != 'resolved')
         Btn('Mark as resolved',
-            kind: BtnKind.gold, onTap: () => s.setReportStatus(r, 'resolved')),
+            kind: BtnKind.gold, onTap: () => _run(ctx, () => s.setReportStatus(r, 'resolved'))),
       if (r.status != 'resolved' && v.status == VehicleStatus.available)
         Btn('Send ${v.code} to repair',
-            icon: TablerIcons.tool, kind: BtnKind.outlined, onTap: () {
-          final err = s.setMaintenance(v, true);
+            icon: TablerIcons.tool, kind: BtnKind.outlined, onTap: () async {
+          final err = await s.setMaintenance(v, true);
+          if (!ctx.mounted) return;
           toast(ctx, err ?? '${v.code} moved to repair', error: err != null);
         }),
       if (r.status == 'resolved')
-        Btn('Reopen', kind: BtnKind.outlined, onTap: () => s.setReportStatus(r, 'open')),
+        Btn('Reopen', kind: BtnKind.outlined, onTap: () => _run(ctx, () => s.setReportStatus(r, 'open'))),
       _close(ctx),
     ];
   });
@@ -175,11 +182,12 @@ void showTopupSheet(BuildContext context, Topup t) {
       ),
       if (t.status == TopupStatus.pending) ...[
         Text('Check the payment arrived before confirming.', style: muStyle),
-        Btn('Confirm payment', icon: TablerIcons.check, onTap: () {
-          final err = s.confirmTopup(t); // = sp_confirm_topup
+        Btn('Confirm payment', icon: TablerIcons.check, onTap: () async {
+          final err = await s.confirmTopup(t); // = sp_confirm_topup
+          if (!ctx.mounted) return;
           toast(ctx, err ?? '${baht(t.amount)} added to ${u.firstName}', error: err != null);
         }),
-        Btn('Mark as failed', kind: BtnKind.outlined, onTap: () => s.rejectTopup(t)),
+        Btn('Mark as failed', kind: BtnKind.outlined, onTap: () => _run(ctx, () => s.rejectTopup(t))),
       ],
       _close(ctx),
     ];
@@ -189,7 +197,7 @@ void showTopupSheet(BuildContext context, Topup t) {
 // ======================================================================= Feedback
 void showFeedbackSheet(BuildContext context, AppFeedback f) {
   final s = AppStore.instance;
-  if (f.status == 'open') s.setFeedbackStatus(f, 'read'); // เปิดอ่าน = อ่านแล้ว
+  if (f.status == 'open') _run(context, () => s.setFeedbackStatus(f, 'read')); // เปิดอ่าน = อ่านแล้ว
   showAdminSheet(context, (ctx) {
     final u = s.userById(f.userId);
     return [
@@ -201,7 +209,7 @@ void showFeedbackSheet(BuildContext context, AppFeedback f) {
           style: muStyle),
       if (f.status != 'resolved')
         Btn('Mark as resolved',
-            kind: BtnKind.gold, onTap: () => s.setFeedbackStatus(f, 'resolved')),
+            kind: BtnKind.gold, onTap: () => _run(ctx, () => s.setFeedbackStatus(f, 'resolved'))),
       _close(ctx),
     ];
   });
@@ -249,16 +257,17 @@ void showVehicleSheet(BuildContext context, Vehicle v) {
       if (ride != null)
         Btn('View current ride', kind: BtnKind.outlined, onTap: () => showRideSheet(ctx, ride)),
       if (v.status == VehicleStatus.available)
-        Btn('Send to repair', icon: TablerIcons.tool, onTap: () {
-          final err = s.setMaintenance(v, true);
-          if (err != null) toast(ctx, err, error: true);
+        Btn('Send to repair', icon: TablerIcons.tool, onTap: () async {
+          final err = await s.setMaintenance(v, true);
+          if (err != null && ctx.mounted) toast(ctx, err, error: true);
         }),
       if (v.status == VehicleStatus.maintenance)
-        Btn('Back in service', icon: TablerIcons.check, kind: BtnKind.gold, onTap: () {
+        Btn('Back in service', icon: TablerIcons.check, kind: BtnKind.gold, onTap: () async {
           if (v.currentStationId == null) {
             return toast(ctx, 'Park it at a station first', error: true);
           }
-          s.setMaintenance(v, false);
+          final err = await s.setMaintenance(v, false);
+          if (err != null && ctx.mounted) toast(ctx, err, error: true);
         }),
       _close(ctx),
     ];

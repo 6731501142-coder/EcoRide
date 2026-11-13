@@ -149,8 +149,9 @@ class _VehiclesTabState extends State<VehiclesTab> {
                 onPressed: () => Navigator.pop(ctx),
                 child: Text('Cancel', style: ts(11, color: C.chipText))),
             TextButton(
-              onPressed: () {
-                final err = s.addVehicle(type: type, number: number.text, station: station);
+              onPressed: () async {
+                final err = await s.addVehicle(type: type, number: number.text, station: station);
+                if (!context.mounted) return;
                 if (err != null) return toast(context, err, error: true);
                 Navigator.pop(ctx);
                 toast(context, 'Vehicle added to ${station.name}');

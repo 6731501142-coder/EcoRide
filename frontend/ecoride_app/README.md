@@ -1,22 +1,23 @@
 # EcoRide – แอปฝั่งผู้ใช้ (ecoride_app)
 
 แอป Flutter ตาม flow ใน *Untitled Draft 2.pdf* และตารางใน *EcoRide – Database Summary.pdf*
-ตอนนี้ใช้ **ข้อมูลจำลองในเครื่อง** (`lib/data/app_store.dart`) ที่ตั้งชื่อฟิลด์ตามคอลัมน์ในฐานข้อมูล
-พอ backend พร้อม เปลี่ยนแค่ข้างใน `AppStore` ให้เรียก API แทน — หน้าจอไม่ต้องแก้
+ตอนนี้ **เชื่อมกับ backend แล้ว** (`../../backend`, Node.js + MariaDB): `lib/data/api_client.dart` เรียก REST API
+และ `lib/data/app_store.dart` เก็บสำเนาข้อมูลล่าสุดไว้ — ดูวิธีรันทั้งโปรเจกต์ใน `../../README.md`
 
 ## วิธีรัน
 ```
+# เปิด backend ก่อน (ดู ../../README.md) แล้ว
 cd frontend/ecoride_app
-flutter create . --platforms=web,windows
 flutter pub get
-flutter run -d chrome
+flutter run -d chrome        # ใช้ backend ที่ http://localhost:3000
+# หรือ: flutter run -d chrome --dart-define=API_BASE=http://<ip>:3000
 ```
 บัญชีทดลอง (ล็อกอินหน้าเดียวกัน แอปดู `users.role` แล้วพาไปหน้าที่ถูกต้อง):
 - นักศึกษา: `somchai.j` / `password123` → หน้า Home
 - แอดมิน: `admin` / `password123` → หน้า Admin (Overview, Stations, Vehicles, Reports, Users)
 
-ทั้งสองฝั่งใช้ข้อมูลชุดเดียวกัน (`AppStore`) → ผู้ใช้กด Need help? / ยืมรถ / เติมเงิน / ส่ง feedback แล้ว
-ล็อกเอาต์ไปเข้า admin จะเห็นทันที
+ทั้งสองฝั่งใช้ฐานข้อมูลชุดเดียวกัน → ผู้ใช้กด Need help? / ยืมรถ / เติมเงิน / ส่ง feedback แล้ว
+แอดมินเห็นหลังแอป refresh (ทุก 60 วินาที หรือหลังกดอะไรสักอย่าง)
 
 ## หน้าจอ
 | ไฟล์ | หน้า |

@@ -506,20 +506,23 @@ class ProfileTab extends StatelessWidget {
     );
     if (action == null) return;
     if (action.startsWith('preset:')) {
-      store.setPresetAvatar(int.parse(action.substring(7)));
-      if (context.mounted) toast(context, 'Avatar updated');
+      final err = await store.setPresetAvatar(int.parse(action.substring(7)));
+      if (!context.mounted) return;
+      toast(context, err ?? 'Avatar updated', error: err != null);
     } else if (action == 'remove') {
-      store.setAvatar(null);
+      final err = await store.setAvatar(null);
+      if (err != null && context.mounted) toast(context, err, error: true);
     } else if (action == 'pick') {
       try {
         final bytes = await pickPhotoBytes();
         if (bytes == null) return; // กดยกเลิก
-        if (bytes.length > 5 * 1024 * 1024) {
-          if (context.mounted) toast(context, 'Please choose a photo under 5 MB', error: true);
+        if (bytes.length > 2 * 1024 * 1024) {
+          // backend รับรูปไม่เกิน 2 MB (png / jpeg / webp)
+          if (context.mounted) toast(context, 'Please choose a photo under 2 MB', error: true);
           return;
         }
-        store.setAvatar(bytes);
-        if (context.mounted) toast(context, 'Profile photo updated');
+        final err = await store.setAvatar(bytes);
+        if (context.mounted) toast(context, err ?? 'Profile photo updated', error: err != null);
       } catch (_) {
         if (context.mounted) toast(context, 'Could not open this photo', error: true);
       }
