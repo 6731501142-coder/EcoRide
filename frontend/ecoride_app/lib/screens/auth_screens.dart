@@ -31,8 +31,14 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   /// ปุ่ม Log in → ถ้าผ่าน ล้างหน้าเก่าทั้งหมดแล้วไปหน้า Home หรือ Admin
-  void _login() {
-    final err = AppStore.instance.login(_user.text, _pass.text);
+  bool _busy = false; // กันกดซ้ำระหว่างรอ backend
+
+  Future<void> _login() async {
+    if (_busy) return;
+    _busy = true;
+    final err = await AppStore.instance.login(_user.text, _pass.text);
+    _busy = false;
+    if (!mounted) return;
     if (err != null) return toast(context, err, error: true);
     // ล็อกอินที่เดียวกัน: role = admin → หน้า Admin, นักศึกษา → หน้า Home
     final admin = AppStore.instance.me!.isAdmin;
@@ -136,14 +142,20 @@ class _RegisterScreenState extends State<RegisterScreen> {
     super.dispose();
   }
 
-  void _signUp() {
-    final err = AppStore.instance.register(
+  bool _busy = false;
+
+  Future<void> _signUp() async {
+    if (_busy) return;
+    _busy = true;
+    final err = await AppStore.instance.register(
       fullName: _name.text,
       studentId: _sid.text,
       username: _user.text,
       password: _pass.text,
       confirm: _confirm.text,
     );
+    _busy = false;
+    if (!mounted) return;
     if (err != null) return toast(context, err, error: true);
     toast(context, 'Account created. Please log in.');
     Navigator.of(context).pop();
@@ -216,14 +228,20 @@ class _ResetPasswordScreenState extends State<ResetPasswordScreen> {
     super.dispose();
   }
 
-  void _confirmReset() {
-    final err = AppStore.instance.resetPassword(
+  bool _busy = false;
+
+  Future<void> _confirmReset() async {
+    if (_busy) return;
+    _busy = true;
+    final err = await AppStore.instance.resetPassword(
       username: _user.text,
       studentId: _sid.text,
       fullName: _name.text,
       password: _pass.text,
       confirm: _confirm.text,
     );
+    _busy = false;
+    if (!mounted) return;
     if (err != null) return toast(context, err, error: true);
     toast(context, 'Password changed. Please log in.');
     Navigator.of(context).pop();
@@ -310,9 +328,10 @@ class _ForgotUsernameScreenState extends State<ForgotUsernameScreen> {
     super.dispose();
   }
 
-  void _find() {
+  Future<void> _find() async {
     final (username, err) =
-        AppStore.instance.findUsername(studentId: _sid.text, fullName: _name.text);
+        await AppStore.instance.findUsername(studentId: _sid.text, fullName: _name.text);
+    if (!mounted) return;
     if (err != null) {
       setState(() => _found = null);
       return toast(context, err, error: true);

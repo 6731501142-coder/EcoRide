@@ -45,8 +45,9 @@ class _HelpScreenState extends State<HelpScreen> {
         message: 'Staff will be sent to "${_where.text.trim()}".',
         ok: 'Call staff');
     if (!ok || !mounted) return;
-    final (no, err) = AppStore.instance.requestHelp(
+    final (no, err) = await AppStore.instance.requestHelp(
         ride: widget.ride, type: type, location: _where.text, details: _details.text);
+    if (!mounted) return;
     if (err != null) return toast(context, err, error: true);
     setState(() => _requestNo = no);
   }
