@@ -22,6 +22,8 @@ class User {
     required this.creditBalance,
     this.role = 'student',
     this.isActive = true,
+    this.avatarId,
+    this.avatarUrl,
   });
 
   final int userId; // user_id
@@ -31,6 +33,8 @@ class User {
   double creditBalance; // credit_balance
   final String role; // role: student / admin
   bool isActive; // is_active (แอดมินระงับบัญชีได้)
+  int? avatarId; // avatar_id (อวาตาร์สำเร็จรูป 1–16)
+  String? avatarUrl; // avatar_url (รูปที่อัปโหลด เช่น /uploads/avatar-1-xxxx.png)
   // password_hash อยู่ฝั่ง backend เท่านั้น ไม่ส่งมาที่แอป
 
   bool get isAdmin => role == 'admin';
@@ -50,6 +54,8 @@ class User {
         creditBalance: _d(j['credit_balance']),
         role: (j['role'] ?? 'student') as String,
         isActive: _b(j['is_active'] ?? 1),
+        avatarId: _iN(j['avatar_id']),
+        avatarUrl: j['avatar_url'] as String?,
       );
 }
 
@@ -64,6 +70,7 @@ class Station {
     this.isActive = true,
     this.iconKey = 'building',
     this.photo,
+    this.photoUrl,
   });
 
   final int stationId; // station_id
@@ -77,7 +84,8 @@ class Station {
   //   stations.icon_key VARCHAR(20) DEFAULT 'building'   ← ไอคอนสำเร็จรูป
   //   stations.photo_url VARCHAR(255) NULL                ← รูปถ่ายจริง (ต้องมี API อัปโหลด)
   String iconKey; // icon_key
-  Uint8List? photo; // ตอนนี้เก็บในหน่วยความจำ (แทน photo_url)
+  Uint8List? photo; // รูปที่ดาวน์โหลดมาจาก photoUrl แล้ว (AppStore โหลดให้) – widget ใช้ตัวนี้
+  String? photoUrl; // photo_url (เช่น /uploads/station-1-xxxx.jpg)
 
   factory Station.fromJson(Map<String, dynamic> j) => Station(
         stationId: _i(j['station_id']),
@@ -87,6 +95,7 @@ class Station {
         longitude: j['longitude'] == null ? null : _d(j['longitude']),
         isActive: _b(j['is_active'] ?? 1),
         iconKey: (j['icon_key'] ?? 'building') as String,
+        photoUrl: j['photo_url'] as String?,
       );
 }
 
@@ -333,7 +342,7 @@ class CreditTransaction {
 }
 
 // ------------------------------------------------------------------ problem_reports
-enum ReportCategory { brakesWheels, damagedPart, lowBattery, electrical, other }
+enum ReportCategory { brakesWheels, damagedPart, lowBattery, electrical, accident, other }
 
 extension ReportCategoryX on ReportCategory {
   String get label => switch (this) {
@@ -341,6 +350,7 @@ extension ReportCategoryX on ReportCategory {
         ReportCategory.damagedPart => 'Damaged part',
         ReportCategory.lowBattery => 'Low battery',
         ReportCategory.electrical => 'Electrical',
+        ReportCategory.accident => 'Accident',
         ReportCategory.other => 'Other',
       };
 
@@ -350,6 +360,7 @@ extension ReportCategoryX on ReportCategory {
         ReportCategory.damagedPart => 'damaged_part',
         ReportCategory.lowBattery => 'low_battery',
         ReportCategory.electrical => 'electrical',
+        ReportCategory.accident => 'accident',
         ReportCategory.other => 'other',
       };
 }
@@ -438,13 +449,13 @@ extension HelpTypeX on HelpType {
         HelpType.flatTyre || HelpType.brakes => ReportCategory.brakesWheels,
         HelpType.damaged => ReportCategory.damagedPart,
         HelpType.battery => ReportCategory.lowBattery,
-        HelpType.accident || HelpType.other => ReportCategory.other,
+        HelpType.accident => ReportCategory.accident, // ENUM ใน DB มี 'accident' อยู่แล้ว
+        HelpType.other => ReportCategory.other,
       };
 }
 
 // ------------------------------------------------------------------ feedback เกี่ยวกับแอป (หน้า Profile)
-// ⚠️ ยังไม่มีตารางใน DB → เสนอให้เพื่อนเพิ่ม:
-//    app_feedback(feedback_id, user_id, topic, message, status, created_at)
+// ตารางใน DB: app_feedback(feedback_id, user_id, topic, message, status, created_at)
 enum FeedbackTopic { appBug, payment, account, suggestion, other }
 
 extension FeedbackTopicX on FeedbackTopic {
@@ -480,4 +491,13 @@ class AppFeedback {
   final String message;
   final DateTime createdAt;
   String status; // open / read / resolved
+
+  factory AppFeedback.fromJson(Map<String, dynamic> j) => AppFeedback(
+        feedbackId: _i(j['feedback_id']),
+        userId: _i(j['user_id']),
+        topic: FeedbackTopic.values.firstWhere((t) => t.db == j['topic'], orElse: () => FeedbackTopic.other),
+        message: j['message'] as String,
+        createdAt: _t(j['created_at']),
+        status: (j['status'] ?? 'open') as String,
+      );
 }

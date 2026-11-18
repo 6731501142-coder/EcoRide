@@ -10,6 +10,7 @@ dependencies:
   flutter:
     sdk: flutter
   tabler_icons_plus: ^3.50.0
+  http: ^1.2.2 # เรียก REST API ของ backend (lib/data/api_client.dart)
   web: ^1.1.0 # ใช้เปิดหน้าต่างเลือกรูปบนเบราว์เซอร์ (ไม่ใช่ปลั๊กอิน ไม่ต้องเปิด Developer Mode)
 
 dev_dependencies:
