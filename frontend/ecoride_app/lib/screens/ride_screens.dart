@@ -324,7 +324,13 @@ class PaymentConfirmScreen extends StatelessWidget {
                           children: [
                             InfoRow('Username', me.username),
                             InfoRow('Bike ID', vehicle.code),
-                            InfoRow('Station', store.stationById(vehicle.currentStationId!).name),
+                            // หลังยืมสำเร็จ รถออกจากสถานีแล้ว (currentStationId = null) แต่หน้านี้ยังวาดอยู่
+                            // ระหว่างแอนิเมชันปิดหน้า → ห้ามใช้ ! ไม่งั้นจอแดง "Null check operator"
+                            InfoRow(
+                                'Station',
+                                vehicle.currentStationId == null
+                                    ? '—'
+                                    : store.stationById(vehicle.currentStationId!).name),
                             InfoRow('Plan', '${plan.name} / ${baht(plan.price)}', last: true),
                           ],
                         ),

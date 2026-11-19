@@ -18,7 +18,9 @@ import 'models.dart';
 
 class AppStore extends ChangeNotifier {
   AppStore(this.api);
-  static final AppStore instance = AppStore(ApiClient()); // ใช้ร่วมกันทุกหน้า
+  // ใช้ร่วมกันทุกหน้า · ไม่ใช่ final เพื่อให้ widget test สลับเป็น store ที่ต่อกับ backend ปลอมได้
+  // (ดู test/fake_backend.dart → useFakeStore / signIn) – โค้ดแอปห้ามกำหนดค่าใหม่
+  static AppStore instance = AppStore(ApiClient());
 
   final ApiClient api;
 
