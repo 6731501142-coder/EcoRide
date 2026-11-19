@@ -201,8 +201,8 @@ class UserDetailScreen extends StatelessWidget {
                                 : 'They can log in and borrow again.',
                             ok: u.isActive ? 'Disable' : 'Enable');
                         if (!ok || !context.mounted) return;
-                        final err = s.setUserActive(u, !u.isActive);
-                        if (err != null) toast(context, err, error: true);
+                        final err = await s.setUserActive(u, !u.isActive);
+                        if (err != null && context.mounted) toast(context, err, error: true);
                       }),
                       const SectionLabel('Rides'),
                       if (rides.isEmpty) Text('No rides yet', style: muStyle),
@@ -295,9 +295,10 @@ class UserDetailScreen extends StatelessWidget {
               onPressed: () => Navigator.pop(ctx),
               child: Text('Cancel', style: ts(11, color: C.chipText))),
           TextButton(
-            onPressed: () {
-              final err = AppStore.instance
+            onPressed: () async {
+              final err = await AppStore.instance
                   .updateUser(u, fullName: name.text, studentId: sid.text);
+              if (!context.mounted) return;
               if (err != null) return toast(context, err, error: true);
               Navigator.pop(ctx);
               toast(context, 'User updated');
@@ -366,10 +367,11 @@ class UserDetailScreen extends StatelessWidget {
                 onPressed: () => Navigator.pop(ctx),
                 child: Text('Cancel', style: ts(11, color: C.chipText))),
             TextButton(
-              onPressed: () {
+              onPressed: () async {
                 final n = double.tryParse(amount.text) ?? 0;
-                final err = AppStore.instance
+                final err = await AppStore.instance
                     .adjustCredit(u, add ? n : -n, reason.text, refund: add && refund);
+                if (!context.mounted) return;
                 if (err != null) return toast(context, err, error: true);
                 Navigator.pop(ctx);
                 toast(context, 'Credit updated: ${baht(u.creditBalance)}');

@@ -1,50 +1,86 @@
-// AppStore – "Model/Controller" ฝั่ง User (ข้อมูล mock ในหน่วยความจำ)
-// กฎทุกข้อเลียนแบบ stored procedure ในฐานข้อมูลของเพื่อน:
-//   borrow()        = sp_borrow_vehicle(user_id, vehicle_id, plan_id, @ride_id)
-//   returnVehicle() = sp_return_vehicle(ride_id, station_id, battery_end)
-//   confirmTopup()  = sp_confirm_topup(topup_id)
-// ตอนต่อ backend: เปลี่ยนเนื้อในฟังก์ชันให้เรียก API แทน หน้าจอไม่ต้องแก้
+// AppStore – "Model/Controller" ฝั่งแอป เชื่อมกับ backend (REST API) แล้ว
+//
+// หลักการ: เก็บ "สำเนา" ข้อมูลล่าสุดจาก backend ไว้ในหน่วยความจำ (cache)
+//   • getter / ฟังก์ชันอ่านข้อมูล (stations, myRides, liveBattery, availability …) ยังเป็น sync เหมือนเดิม
+//     → หน้าจอที่แค่แสดงผลไม่ต้องแก้
+//   • ฟังก์ชันที่เปลี่ยนข้อมูล (login, borrow, returnVehicle, confirmTopup …) เป็น Future:
+//     เรียก API → สำเร็จแล้ว refresh() ดึงข้อมูลใหม่ → notifyListeners()
+//   • ข้อความ error ที่คืนมาคือข้อความจาก backend (ตรงกับที่แอปเคยโชว์)
+// กฎจริง (หักเครดิต, คืนรถ, เติมเงิน) ทำใน stored procedure ของ DB:
+//   borrow() = sp_borrow_vehicle · returnVehicle() = sp_return_vehicle · confirmTopup() = sp_confirm_topup
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
+import 'api_client.dart';
 import 'models.dart';
 
 class AppStore extends ChangeNotifier {
-  AppStore._() {
-    _seed();
-  }
-  static final AppStore instance = AppStore._(); // ใช้ร่วมกันทุกหน้า
+  AppStore(this.api);
+  static final AppStore instance = AppStore(ApiClient()); // ใช้ร่วมกันทุกหน้า
+
+  final ApiClient api;
 
   static const int minBattery = 20; // แบตขั้นต่ำที่ยืมได้
   static const double minTopup = 20, maxTopup = 5000; // เติมเงินต่อครั้ง
 
-  /// เร่งเวลาจำลองแบต (1 = เวลาจริง) – ตอนเดโมหน้าห้องตั้ง 30 จะเห็นแบตขยับเร็วขึ้น 30 เท่า
+  /// เร่งเวลาจำลองแบต (1 = เวลาจริง) – ต้องตรงกับ BATTERY_TIME_SCALE ใน .env ของ backend
   static const double timeScale = 1;
 
-  final List<User> _users = [];
-  final Map<int, String> _passwords = {}; // mock เท่านั้น – backend จริงเก็บ hash
-  final List<Station> _stations = [];
-  final List<VehicleType> _types = [];
-  final List<Vehicle> _vehicles = [];
-  final List<RentalPlan> _plans = [];
-  final List<Ride> _rides = [];
-  final List<Topup> _topups = [];
-  final List<CreditTransaction> _txns = [];
-  final List<ProblemReport> _reports = [];
-  int _nextUser = 1, _nextRide = 1, _nextTopup = 1, _nextTxn = 1, _nextReport = 1;
+  // ---------------------------------------------------------------- cache (สำเนาข้อมูลจาก backend)
+  // User / Station / Vehicle เก็บเป็น Map ตาม id เพื่อให้ object เดิมถูกอัปเดตแทนที่จะสร้างใหม่
+  // (หน้าจอที่ถือ object อยู่จะเห็นค่าใหม่ และ `==` ยังใช้ได้)
+  final Map<int, User> _usersById = {};
+  final Map<int, Station> _stationsById = {};
+  final Map<int, Vehicle> _vehiclesById = {};
+  List<VehicleType> _types = [];
+  List<RentalPlan> _plans = [];
+  List<Ride> _rides = [];
+  List<Topup> _topups = [];
+  List<CreditTransaction> _txns = [];
+  List<ProblemReport> _reports = [];
+  List<AppFeedback> _feedback = [];
+  final Map<String, Uint8List> _images = {}; // url → รูปที่โหลดแล้ว (avatar / รูปสถานี)
+  final Set<String> _loadingImages = {};
+
+  List<User> get _users => _usersById.values.toList();
+  List<Vehicle> get _vehicles => _vehiclesById.values.toList();
+  List<Station> get _stations => _stationsById.values.toList();
 
   User? _me;
   User? get me => _me;
 
-  // ตัวจับเวลา: ล็อกอินอยู่ → ให้หน้าจออัปเดตแบต (ขี่/ชาร์จ) และเวลาทุก 15 วินาที
+  // ตัวจับเวลา: ล็อกอินอยู่ → อัปเดตหน้าจอ (แบต ขี่/ชาร์จ, เวลา) ทุก 15 วินาที
+  // และดึงข้อมูลใหม่จาก backend ทุก 60 วินาที (เห็นสิ่งที่คนอื่น/แอดมินเปลี่ยน)
   Timer? _ticker;
-  void _startTicker() =>
-      _ticker ??= Timer.periodic(const Duration(seconds: 15), (_) => notifyListeners());
+  int _tick = 0;
+  void _startTicker() => _ticker ??= Timer.periodic(const Duration(seconds: 15), (_) {
+        _tick++;
+        if (_tick % 4 == 0) {
+          refresh().catchError((_) {}); // เงียบ – ถ้า server ล่มก็แค่ใช้ข้อมูลเดิม
+        } else {
+          notifyListeners();
+        }
+      });
 
   void _stopTicker() {
     _ticker?.cancel();
     _ticker = null;
+    _tick = 0;
+  }
+
+  /// ครอบการเรียก API: สำเร็จ → null, ล้มเหลว → ข้อความ error ให้โชว์ผู้ใช้
+  Future<String?> _guard(Future<void> Function() body) async {
+    try {
+      await body();
+      return null;
+    } on ApiException catch (e) {
+      return e.message;
+    } catch (e, st) {
+      debugPrint('AppStore error: $e\n$st');
+      return 'Something went wrong. Please try again.';
+    }
   }
 
   // ================================================================ แบตเตอรี่ (จำลองให้ใกล้ชีวิตจริง)
@@ -59,7 +95,7 @@ class AppStore extends ChangeNotifier {
   //   ชาร์จเร็วถึง 80% แล้วช้าลงช่วง 80→100% (เหมือนแบตลิเธียมจริง)
   //   รถที่คืนมาแบต 0% ก็ชาร์จได้ปกติ ถึง 20% (ยืมได้) ภายในไม่ถึงชั่วโมง
   //
-  // ของจริง: ตัวรถ (IoT) ส่งค่าแบตจริงให้ backend แล้วแอปดึงค่านั้นมาแสดงแทนการคำนวณนี้
+  // backend คำนวณสูตรเดียวกัน (src/services/batteryService.js) แอปใช้ค่าจาก backend เป็นจุดเริ่ม แล้วเดินต่อเองระหว่างรอ refresh
 
   /// ค่าคงที่ของรถแต่ละประเภท
   static ({double speedKmh, double pctPerKm, double fastPerHour, double slowPerHour}) specOf(
@@ -79,7 +115,7 @@ class AppStore extends ChangeNotifier {
     return movingHours * specOf(typeOf(v)).speedKmh;
   }
 
-  // แบต + เวลาที่เริ่มชาร์จ ของรถที่จอดอยู่ (ตอนต่อ backend: battery_level + updated_at)
+  // แบต + เวลาที่เริ่มชาร์จ ของรถที่จอดอยู่ (ตั้งจาก live_battery ที่ backend ส่งมาทุกครั้งที่ refresh)
   final Map<int, (double, DateTime)> _chargeFrom = {};
 
   double _charged(VehicleType t, double from, Duration d) {
@@ -134,176 +170,167 @@ class AppStore extends ChangeNotifier {
   /// จำนวนรถที่กำลังชาร์จ (ทุกสถานี)
   int get totalCharging => _vehicles.where(isCharging).length;
 
-  // รูปโปรไฟล์ มี 2 แบบ (ใช้ได้ทีละแบบ):
-  //  1) อวาตาร์สำเร็จรูป → เก็บแค่เลข id (ถ้าจะเก็บจริงให้เพิ่ม users.avatar_id ใน DB)
-  //  2) รูปที่อัปโหลดเอง → เก็บในหน่วยความจำ (ถ้าจะเก็บจริงต้องมี users.avatar_url + API อัปโหลด)
-  final Map<int, int> _avatarIds = {};
-  final Map<int, Uint8List> _avatars = {};
-  int? get avatarId => _me == null ? null : _avatarIds[_me!.userId];
-  Uint8List? get avatarBytes => _me == null ? null : _avatars[_me!.userId];
-  bool get hasAvatar => avatarId != null || avatarBytes != null;
-
-  void setPresetAvatar(int id) {
-    final u = _me;
-    if (u == null) return;
-    _avatars.remove(u.userId);
-    _avatarIds[u.userId] = id;
-    notifyListeners();
+  // ================================================================ รูปโปรไฟล์ / รูปสถานี
+  // อวาตาร์มี 2 แบบ (ใช้ได้ทีละแบบ): สำเร็จรูป (users.avatar_id) หรืออัปโหลดเอง (users.avatar_url)
+  // รูปที่อัปโหลดจะถูกดาวน์โหลดมาเก็บเป็น bytes เพื่อให้ widget เดิม (Image.memory) ใช้ต่อได้
+  int? get avatarId => _me?.avatarId;
+  Uint8List? get avatarBytes {
+    final url = _me?.avatarUrl;
+    return url == null ? null : _images[url];
   }
 
-  void setAvatar(Uint8List? bytes) {
-    final u = _me;
-    if (u == null) return;
-    _avatarIds.remove(u.userId);
-    if (bytes == null) {
-      _avatars.remove(u.userId);
-    } else {
-      _avatars[u.userId] = bytes;
+  bool get hasAvatar => avatarId != null || avatarBytes != null;
+
+  Future<String?> setPresetAvatar(int id) => _guard(() async {
+        _applyUser(await api.put('/me/avatar', {'avatar_id': id}) as Map<String, dynamic>);
+        notifyListeners();
+      });
+
+  /// bytes == null → ลบรูป (กลับไปใช้ตัวอักษรย่อ)
+  Future<String?> setAvatar(Uint8List? bytes) => _guard(() async {
+        final Map<String, dynamic> json;
+        if (bytes == null) {
+          json = await api.delete('/me/avatar') as Map<String, dynamic>;
+        } else {
+          json = await api.post('/me/avatar/photo', {
+            'image_base64': base64Encode(bytes),
+            'mime': sniffImageMime(bytes),
+          }) as Map<String, dynamic>;
+        }
+        final u = _applyUser(json);
+        if (u.avatarUrl != null && bytes != null) _images[u.avatarUrl!] = bytes; // ไม่ต้องโหลดซ้ำ
+        notifyListeners();
+      });
+
+  /// ดาวน์โหลดรูปที่ backend เก็บไว้ (ครั้งเดียวต่อ url) แล้วแจ้งหน้าจอให้วาดใหม่
+  void _ensureImage(String? url, [void Function(Uint8List bytes)? onLoaded]) {
+    if (url == null) return;
+    final cached = _images[url];
+    if (cached != null) {
+      onLoaded?.call(cached);
+      return;
     }
-    notifyListeners();
+    if (!_loadingImages.add(url)) return;
+    api.downloadImage(url).then((bytes) {
+      _loadingImages.remove(url);
+      if (bytes == null) return;
+      _images[url] = bytes;
+      onLoaded?.call(bytes);
+      notifyListeners();
+    });
   }
 
   // ================================================================ auth
-  /// Login – คืน null ถ้าสำเร็จ หรือข้อความ error
-  String? login(String username, String password) {
-    final u = _userByUsername(username.trim());
-    if (u == null || _passwords[u.userId] != password) {
-      return 'Wrong username or password';
-    }
-    if (!u.isActive) return 'This account has been disabled';
-    // admin ก็ล็อกอินที่หน้านี้ได้ → หน้า Login จะพาไปหน้า Admin เอง (ดู role)
-    _me = u;
-    _startTicker();
-    notifyListeners();
-    return null;
-  }
+  /// Login – คืน null ถ้าสำเร็จ หรือข้อความ error (admin ก็ล็อกอินที่หน้านี้ → หน้า Login พาไปหน้า Admin ตาม role)
+  Future<String?> login(String username, String password) => _guard(() async {
+        final res = await api.post('/auth/login', {'username': username.trim(), 'password': password})
+            as Map<String, dynamic>;
+        api.token = res['token'] as String;
+        try {
+          _me = _applyUser(res['user'] as Map<String, dynamic>);
+          await refresh();
+        } catch (_) {
+          _clear(); // โหลดข้อมูลไม่สำเร็จ → ไม่ค้างสถานะล็อกอินครึ่งๆ กลางๆ
+          rethrow;
+        }
+        _startTicker();
+        notifyListeners();
+      });
 
   void logout() {
     _stopTicker();
-    _me = null;
+    _clear();
     notifyListeners();
   }
 
-  String? register({
+  void _clear() {
+    api.token = null;
+    _me = null;
+    _usersById.clear();
+    _stationsById.clear();
+    _vehiclesById.clear();
+    _chargeFrom.clear();
+    _types = [];
+    _plans = [];
+    _rides = [];
+    _topups = [];
+    _txns = [];
+    _reports = [];
+    _feedback = [];
+  }
+
+  Future<String?> register({
     required String fullName,
     required String studentId,
     required String username,
     required String password,
     required String confirm,
-  }) {
-    if ([fullName, studentId, username, password].any((s) => s.trim().isEmpty)) {
-      return 'Please fill in every field';
-    }
-    final pwErr = _checkNewPassword(password, confirm);
-    if (pwErr != null) return pwErr;
-    if (_userByUsername(username.trim()) != null) return 'Username is already taken';
-    if (_users.any((u) => u.studentId == studentId.trim())) {
-      return 'Student ID is already registered';
-    }
-    final u = User(
-      userId: _nextUser++,
-      studentId: studentId.trim(),
-      username: username.trim(),
-      fullName: fullName.trim(),
-      creditBalance: 0,
-    );
-    _users.add(u);
-    _passwords[u.userId] = password;
-    notifyListeners();
-    return null;
-  }
+  }) =>
+      _guard(() async {
+        await api.post('/auth/register', {
+          'full_name': fullName,
+          'student_id': studentId,
+          'username': username,
+          'password': password,
+          'confirm': confirm,
+        });
+      });
 
   /// Reset password: ยืนยันตัวตนด้วย username + student ID + full name ต้องตรงทั้ง 3 อย่าง
-  String? resetPassword({
+  Future<String?> resetPassword({
     required String username,
     required String studentId,
     required String fullName,
     required String password,
     required String confirm,
-  }) {
-    if ([username, studentId, fullName].any((s) => s.trim().isEmpty)) {
-      return 'Please fill in every field';
-    }
-    final u = _userByUsername(username.trim());
-    if (u == null ||
-        u.studentId != studentId.trim() ||
-        u.fullName.toLowerCase() != fullName.trim().toLowerCase()) {
-      return 'Username, student ID and full name do not match';
-    }
-    final pwErr = _checkNewPassword(password, confirm);
-    if (pwErr != null) return pwErr;
-    _passwords[u.userId] = password;
-    return null;
-  }
+  }) =>
+      _guard(() async {
+        await api.post('/auth/reset-password', {
+          'username': username,
+          'student_id': studentId,
+          'full_name': fullName,
+          'password': password,
+          'confirm': confirm,
+        });
+      });
 
   /// Forgot username: หา username จาก student ID + full name → (username, null) หรือ (null, error)
-  (String?, String?) findUsername({required String studentId, required String fullName}) {
-    if (studentId.trim().isEmpty || fullName.trim().isEmpty) {
-      return (null, 'Please fill in every field');
-    }
-    for (final u in _users) {
-      if (u.studentId == studentId.trim() &&
-          u.fullName.toLowerCase() == fullName.trim().toLowerCase()) {
-        return (u.username, null);
-      }
-    }
-    return (null, 'No account matches this student ID and name');
+  Future<(String?, String?)> findUsername({required String studentId, required String fullName}) async {
+    String? name;
+    final err = await _guard(() async {
+      final res = await api.post('/auth/find-username', {'student_id': studentId, 'full_name': fullName})
+          as Map<String, dynamic>;
+      name = res['username'] as String?;
+    });
+    return (err == null ? name : null, err);
   }
 
-  String? updateProfile({
+  Future<String?> updateProfile({
     required String fullName,
     required String studentId,
     required String username,
-  }) {
-    final u = _me!;
-    if ([fullName, studentId, username].any((s) => s.trim().isEmpty)) {
-      return 'Please fill in every field';
-    }
-    final other = _userByUsername(username.trim());
-    if (other != null && other.userId != u.userId) return 'Username is already taken';
-    if (_users.any((x) => x.userId != u.userId && x.studentId == studentId.trim())) {
-      return 'Student ID is already registered';
-    }
-    u
-      ..fullName = fullName.trim()
-      ..studentId = studentId.trim()
-      ..username = username.trim();
-    notifyListeners();
-    return null;
-  }
+  }) =>
+      _guard(() async {
+        _applyUser(await api.put('/me', {'full_name': fullName, 'student_id': studentId, 'username': username})
+            as Map<String, dynamic>);
+        notifyListeners();
+      });
 
-  String? changePassword(String current, String password, String confirm) {
-    final u = _me!;
-    if (_passwords[u.userId] != current) return 'Current password is incorrect';
-    final pwErr = _checkNewPassword(password, confirm);
-    if (pwErr != null) return pwErr;
-    _passwords[u.userId] = password;
-    return null;
-  }
+  Future<String?> changePassword(String current, String password, String confirm) => _guard(() async {
+        await api.put('/me/password', {'current': current, 'password': password, 'confirm': confirm});
+      });
 
-  String? _checkNewPassword(String p, String c) {
-    if (p.length < 8) return 'Password must be at least 8 characters';
-    if (p != c) return 'Passwords do not match';
-    return null;
-  }
-
-  User? _userByUsername(String name) {
-    for (final u in _users) {
-      if (u.username.toLowerCase() == name.toLowerCase()) return u;
-    }
-    return null;
-  }
-
-  // ================================================================ lookups
+  // ================================================================ lookups (อ่านจาก cache)
   List<Station> get stations => _stations.where((s) => s.isActive).toList();
   List<RentalPlan> get plans => List.unmodifiable(_plans);
   RentalPlan get defaultPlan => _plans.first;
 
-  Station stationById(int id) => _stations.firstWhere((s) => s.stationId == id);
-  Vehicle vehicleById(int id) => _vehicles.firstWhere((v) => v.vehicleId == id);
+  Station stationById(int id) => _stationsById[id]!;
+  Vehicle vehicleById(int id) => _vehiclesById[id]!;
   VehicleType typeOf(Vehicle v) => _types.firstWhere((t) => t.typeId == v.typeId);
   RentalPlan planById(int id) => _plans.firstWhere((p) => p.planId == id);
 
+  /// ค้นจาก cache (รายการรถทั้งหมดถูกโหลดมาแล้ว) – ใช้ตอนพิมพ์/สแกนรหัสรถ
   Vehicle? vehicleByCode(String code) {
     for (final v in _vehicles) {
       if (v.code.toUpperCase() == code.trim().toUpperCase()) return v;
@@ -323,11 +350,9 @@ class AppStore extends ChangeNotifier {
   }
 
   bool canBorrowVehicle(Vehicle v) =>
-      v.status == VehicleStatus.available &&
-      v.currentStationId != null &&
-      liveBattery(v) >= minBattery;
+      v.status == VehicleStatus.available && v.currentStationId != null && liveBattery(v) >= minBattery;
 
-  /// = SELECT * FROM v_station_availability WHERE station_id = ?
+  /// = v_station_availability (คำนวณจากรถใน cache ด้วยแบตสด)
   StationAvailability availability(Station s) {
     final docked = _vehicles.where((v) => v.currentStationId == s.stationId).toList();
     final ready = docked.where(canBorrowVehicle);
@@ -353,20 +378,18 @@ class AppStore extends ChangeNotifier {
   /// = v_ride_history ของฉัน ใหม่สุดก่อน
   List<Ride> get myRides {
     if (_me == null) return [];
-    return _rides.where((r) => r.userId == _me!.userId).toList()
-      ..sort((a, b) => b.startTime.compareTo(a.startTime));
+    return _rides.where((r) => r.userId == _me!.userId).toList()..sort((a, b) => b.startTime.compareTo(a.startTime));
   }
 
   /// = v_user_monthly_stats (เดือนปัจจุบัน)
   MonthlyStats get monthlyStats {
     final now = DateTime.now();
-    final rides = myRides
-        .where((r) => r.startTime.year == now.year && r.startTime.month == now.month)
-        .toList();
+    final rides =
+        myRides.where((r) => r.startTime.year == now.year && r.startTime.month == now.month).toList();
     return MonthlyStats(
       rides: rides.length,
       // รวมเวลาของรอบที่กำลังขี่อยู่ด้วย (นับถึงตอนนี้) จะได้เห็นตัวเลขขยับทันที
-      // หมายเหตุ: view ใน DB นับเฉพาะรอบที่คืนแล้ว ถ้าต่อ backend ต้องบวกรอบที่ค้างเองแบบนี้
+      // หมายเหตุ: view ใน DB นับเฉพาะรอบที่คืนแล้ว จึงบวกรอบที่ค้างเองแบบนี้
       minutes: rides.fold(0, (m, r) => m + r.usedTime.inMinutes),
       spent: rides.fold(0.0, (s, r) => s + r.pricePaid),
     );
@@ -374,174 +397,98 @@ class AppStore extends ChangeNotifier {
 
   List<CreditTransaction> get myTransactions {
     if (_me == null) return [];
-    return _txns.where((t) => t.userId == _me!.userId).toList()
-      ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return _txns.where((t) => t.userId == _me!.userId).toList()..sort((a, b) => b.createdAt.compareTo(a.createdAt));
   }
 
   // ================================================================ borrow / return
   /// = sp_borrow_vehicle – คืน (ride, null) ถ้าสำเร็จ หรือ (null, error)
-  (Ride?, String?) borrow(Vehicle v, RentalPlan plan) {
-    final u = _me!;
-    if (activeRide != null) return (null, 'You already have a vehicle out. Return it first.');
-    if (v.status != VehicleStatus.available || v.currentStationId == null) {
-      return (null, '${v.code} is not available');
-    }
-    final startBattery = liveBattery(v);
-    if (startBattery < minBattery) {
-      return (null, 'Battery is below $minBattery%. Please choose another vehicle.');
-    }
-    if (u.creditBalance < plan.price) return (null, 'Not enough credit. Please top up first.');
-
-    final now = DateTime.now();
-    final ride = Ride(
-      rideId: _nextRide++,
-      userId: u.userId,
-      vehicleId: v.vehicleId,
-      planId: plan.planId,
-      startStationId: v.currentStationId!,
-      startTime: now,
-      dueTime: now.add(Duration(hours: plan.durationHours)),
-      pricePaid: plan.price,
-      batteryStart: startBattery,
-    );
-    _rides.add(ride);
-    u.creditBalance -= plan.price; // หักเครดิต + ลงบัญชีในขั้นเดียว
-    _txns.add(CreditTransaction(
-      txnId: _nextTxn++,
-      userId: u.userId,
-      txnType: 'ride_payment',
-      rideId: ride.rideId,
-      amount: -plan.price,
-      balanceAfter: u.creditBalance,
-      createdAt: now,
-      note: 'Ride ${v.code}',
-    ));
-    v
-      ..status = VehicleStatus.inUse
-      ..batteryLevel = startBattery
-      ..currentStationId = null; // รถออกจากสถานี
-    _chargeFrom.remove(v.vehicleId);
-    notifyListeners();
-    return (ride, null);
+  Future<(Ride?, String?)> borrow(Vehicle v, RentalPlan plan) async {
+    Ride? ride;
+    final err = await _guard(() async {
+      final res = await api.post('/rides', {'vehicle_id': v.vehicleId, 'plan_id': plan.planId})
+          as Map<String, dynamic>;
+      final id = Ride.fromJson(res['ride'] as Map<String, dynamic>).rideId;
+      await refresh();
+      ride = _rides.firstWhere((r) => r.rideId == id);
+    });
+    return (err == null ? ride : null, err);
   }
 
   /// = sp_return_vehicle – คืนได้เฉพาะสถานีที่ยืมมา และสถานีต้องมีช่องว่าง
-  String? returnVehicle(Ride ride, Station station, {int? batteryEnd}) {
-    if (!ride.isOpen) return 'This ride is already finished';
-    if (station.stationId != ride.startStationId) {
-      return 'You can only return to ${stationById(ride.startStationId).name}';
-    }
-    if (availability(station).full) return '${station.name} is full';
-    final v = vehicleById(ride.vehicleId);
-    final int end = batteryEnd ?? liveBattery(v); // ส่งเป็น p_battery_end ให้ sp_return_vehicle
-    ride
-      ..status = RideStatus.returned
-      ..returnStationId = station.stationId
-      ..endTime = DateTime.now()
-      ..batteryEnd = end;
-    v
-      ..status = VehicleStatus.available
-      ..currentStationId = station.stationId
-      ..batteryLevel = end;
-    _chargeFrom[v.vehicleId] = (end.toDouble(), DateTime.now()); // เสียบชาร์จทันทีที่คืน
-    notifyListeners();
-    return null;
-  }
+  /// แบตตอนคืน backend คำนวณเอง ([batteryEnd] เก็บไว้เพื่อให้ signature เดิมยังเรียกได้ แต่ไม่ถูกส่งไป)
+  Future<String?> returnVehicle(Ride ride, Station station, {int? batteryEnd}) => _guard(() async {
+        await api.post('/rides/${ride.rideId}/return', {'station_id': station.stationId});
+        await refresh();
+      });
 
   // ================================================================ credit
-  Topup createTopup(double amount) {
-    assert(amount >= minTopup && amount <= maxTopup);
-    final t = Topup(
-        topupId: _nextTopup++, userId: _me!.userId, amount: amount, createdAt: DateTime.now());
-    _topups.add(t);
-    return t;
+  /// สร้างรายการเติมเงิน (pending) → หน้าจอโชว์ QR → แล้วเรียก confirmTopup
+  Future<(Topup?, String?)> createTopup(double amount) async {
+    Topup? t;
+    final err = await _guard(() async {
+      t = Topup.fromJson(await api.post('/topups', {'amount': amount}) as Map<String, dynamic>);
+    });
+    return (err == null ? t : null, err);
   }
 
-  /// = sp_confirm_topup – เรียกหลังจ่าย QR สำเร็จ
-  String? confirmTopup(Topup t) {
-    if (t.status != TopupStatus.pending) return 'Top-up not found or not pending';
-    final u = _users.firstWhere((x) => x.userId == t.userId);
-    t
-      ..status = TopupStatus.paid
-      ..paidAt = DateTime.now();
-    u.creditBalance += t.amount;
-    _txns.add(CreditTransaction(
-      txnId: _nextTxn++,
-      userId: u.userId,
-      txnType: 'topup',
-      topupId: t.topupId,
-      amount: t.amount,
-      balanceAfter: u.creditBalance,
-      createdAt: t.paidAt!,
-      note: 'Top up',
-    ));
-    notifyListeners();
-    return null;
-  }
+  /// = sp_confirm_topup – เรียกหลังจ่าย QR สำเร็จ (แอดมินใช้ปุ่มเดียวกันยืนยันแทนผู้ใช้ได้)
+  Future<String?> confirmTopup(Topup t) => _guard(() async {
+        final path = (_me?.isAdmin ?? false) ? '/admin/topups/${t.topupId}/confirm' : '/topups/${t.topupId}/confirm';
+        final res = await api.post(path) as Map<String, dynamic>;
+        final paid = Topup.fromJson(res['topup'] as Map<String, dynamic>);
+        t
+          ..status = paid.status
+          ..paidAt = paid.paidAt;
+        await refresh();
+      });
 
   // ================================================================ help & feedback
-  final List<AppFeedback> _feedback = [];
-  int _nextFeedback = 1;
-
   /// ปุ่ม "Need help?" ในหน้า Summary: แจ้งเจ้าหน้าที่ให้มาหาที่จุดเกิดเหตุ
-  /// = INSERT INTO problem_reports (ผูก ride_id + vehicle_id ของการยืมนี้)
-  /// คืน (เลขคำขอ, null) หรือ (null, error)
-  (int?, String?) requestHelp({
+  /// = INSERT INTO problem_reports (ผูก ride_id + vehicle_id ของการยืมนี้) – คืน (เลขคำขอ, null) หรือ (null, error)
+  Future<(int?, String?)> requestHelp({
     required Ride ride,
     required HelpType type,
     required String location,
     String details = '',
-  }) {
-    if (!ride.isOpen) return (null, 'This ride is already finished');
-    if (location.trim().isEmpty) return (null, 'Please tell staff where you are');
-    final note = StringBuffer('[URGENT] ${type.label} · at: ${location.trim()}');
-    if (details.trim().isNotEmpty) note.write(' · ${details.trim()}');
-    final r = ProblemReport(
-      reportId: _nextReport++,
-      userId: _me!.userId,
-      vehicleId: ride.vehicleId,
-      rideId: ride.rideId,
-      category: type.category,
-      details: note.toString(),
-      createdAt: DateTime.now(),
-    );
-    _reports.add(r);
-    notifyListeners();
-    return (r.reportId, null);
+  }) async {
+    int? id;
+    final err = await _guard(() async {
+      final res = await api.post('/rides/${ride.rideId}/help', {
+        'type': type.name,
+        'location': location,
+        'details': details,
+      }) as Map<String, dynamic>;
+      id = ProblemReport.fromJson(res).reportId;
+    });
+    return (err == null ? id : null, err);
   }
 
   /// เมนู "Report & feedback" ในหน้า Profile: แจ้งปัญหาแอป/ข้อเสนอแนะ ส่งถึง admin
-  String? submitFeedback({required FeedbackTopic topic, required String message}) {
-    if (message.trim().length < 5) return 'Please tell us a bit more';
-    _feedback.add(AppFeedback(
-      feedbackId: _nextFeedback++,
-      userId: _me!.userId,
-      topic: topic,
-      message: message.trim(),
-      createdAt: DateTime.now(),
-    ));
-    notifyListeners();
-    return null;
-  }
+  Future<String?> submitFeedback({required FeedbackTopic topic, required String message}) => _guard(() async {
+        await api.post('/feedback', {'topic': topic.db, 'message': message});
+      });
 
-  /// ข้อความรายการใน Payment history: ค่ายืมโชว์รหัสรถเสมอ (sp_borrow_vehicle เขียน note แค่ "Ride payment")
+  /// ข้อความรายการใน Payment history: ค่ายืมโชว์รหัสรถเสมอ
   String txnLabel(CreditTransaction t) {
     if (t.rideId == null) return t.label;
     for (final r in _rides) {
-      if (r.rideId == t.rideId) return 'Ride · ${vehicleById(r.vehicleId).code}';
+      if (r.rideId == t.rideId) {
+        final v = _vehiclesById[r.vehicleId];
+        return v == null ? t.label : 'Ride · ${v.code}';
+      }
     }
     return t.label;
   }
 
   // ================================================================ ฝั่ง Admin
-  // หน้า admin (lib/admin/) ใช้ข้อมูลชุดเดียวกับฝั่งผู้ใช้ → ผู้ใช้กดอะไร แอดมินเห็นทันที
-  //   ผู้ใช้ยืม/คืน → Rides · กด Need help? → Issues · เติมเงิน → Top-ups · ส่ง feedback → Feedback
+  // หน้า admin (lib/admin/) ใช้ cache ชุดเดียวกัน: ผู้ใช้ยืม/คืน → Rides · กด Need help? → Issues ·
+  // เติมเงิน → Top-ups · ส่ง feedback → Feedback  (แอดมินเห็นหลัง refresh ทุก 60 วินาทีหรือหลังกดอะไรสักอย่าง)
 
   List<Station> get allStations => List.unmodifiable(_stations); // รวมสถานีที่ปิดอยู่
   List<Vehicle> get vehicles => List.unmodifiable(_vehicles);
   List<VehicleType> get types => List.unmodifiable(_types);
   List<User> get students => _users.where((u) => !u.isAdmin).toList();
-  User userById(int id) => _users.firstWhere((u) => u.userId == id);
+  User userById(int id) => _usersById[id]!;
 
   /// รอบที่ยังไม่คืน – เกินเวลาขึ้นก่อน
   List<Ride> get openRides => _rides.where((r) => r.isOpen).toList()
@@ -559,9 +506,8 @@ class AppStore extends ChangeNotifier {
   }
 
   /// รายได้เดือนนี้ = ค่ายืมที่ตัดเครดิตไปแล้ว (ride_payment) – เครดิตคงเหลือของผู้ใช้ไม่ใช่รายได้
-  double get revenueThisMonth => _txns
-      .where((t) => t.txnType == 'ride_payment' && _thisMonth(t.createdAt))
-      .fold(0.0, (s, t) => s - t.amount);
+  double get revenueThisMonth =>
+      _txns.where((t) => t.txnType == 'ride_payment' && _thisMonth(t.createdAt)).fold(0.0, (s, t) => s - t.amount);
 
   double get topupsThisMonth => _topups
       .where((t) => t.status == TopupStatus.paid && t.paidAt != null && _thisMonth(t.paidAt!))
@@ -571,34 +517,21 @@ class AppStore extends ChangeNotifier {
     ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
   List<Topup> get allTopups => [..._topups]..sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
-  List<CreditTransaction> txnsOf(User u) => _txns.where((t) => t.userId == u.userId).toList()
-    ..sort((a, b) => b.createdAt.compareTo(a.createdAt));
+  List<CreditTransaction> txnsOf(User u) =>
+      _txns.where((t) => t.userId == u.userId).toList()..sort((a, b) => b.createdAt.compareTo(a.createdAt));
 
   /// เงินไม่เข้า → topups.status = failed
-  void rejectTopup(Topup t) {
-    if (t.status != TopupStatus.pending) return;
-    t.status = TopupStatus.failed;
-    notifyListeners();
-  }
+  Future<String?> rejectTopup(Topup t) => _guard(() async {
+        await api.post('/admin/topups/${t.topupId}/reject');
+        t.status = TopupStatus.failed;
+        await refresh();
+      });
 
   /// ปรับเครดิต → credit_transactions (refund / adjustment)
-  String? adjustCredit(User u, double amount, String reason, {bool refund = false}) {
-    if (amount == 0) return 'Amount cannot be 0';
-    if (reason.trim().isEmpty) return 'Please give a reason';
-    if (u.creditBalance + amount < 0) return 'Credit cannot go below ฿0';
-    u.creditBalance += amount;
-    _txns.add(CreditTransaction(
-      txnId: _nextTxn++,
-      userId: u.userId,
-      txnType: refund ? 'refund' : 'adjustment',
-      amount: amount,
-      balanceAfter: u.creditBalance,
-      note: reason.trim(),
-      createdAt: DateTime.now(),
-    ));
-    notifyListeners();
-    return null;
-  }
+  Future<String?> adjustCredit(User u, double amount, String reason, {bool refund = false}) => _guard(() async {
+        await api.post('/admin/users/${u.userId}/credit', {'amount': amount, 'reason': reason, 'refund': refund});
+        await refresh();
+      });
 
   /// issue: ด่วนก่อน → ยังไม่ปิด → ใหม่ก่อน
   List<ProblemReport> get reports => [..._reports]..sort((a, b) {
@@ -609,11 +542,14 @@ class AppStore extends ChangeNotifier {
   List<ProblemReport> get openReports => reports.where((r) => r.status != 'resolved').toList();
   List<ProblemReport> get urgentOpen => openReports.where((r) => r.isUrgent).toList();
 
-  void setReportStatus(ProblemReport r, String status) {
-    r.status = status;
-    r.resolvedAt = status == 'resolved' ? DateTime.now() : null;
-    notifyListeners();
-  }
+  Future<String?> setReportStatus(ProblemReport r, String status) => _guard(() async {
+        await api.put('/admin/reports/${r.reportId}/status', {'status': status});
+        r
+          ..status = status
+          ..resolvedAt = status == 'resolved' ? DateTime.now() : null;
+        notifyListeners();
+        await refresh();
+      });
 
   List<AppFeedback> get feedback => [..._feedback]..sort((a, b) {
       if ((a.status == 'resolved') != (b.status == 'resolved')) {
@@ -623,293 +559,214 @@ class AppStore extends ChangeNotifier {
     });
   int get unreadFeedback => _feedback.where((f) => f.status == 'open').length;
 
-  void setFeedbackStatus(AppFeedback f, String status) {
-    f.status = status;
-    notifyListeners();
-  }
+  Future<String?> setFeedbackStatus(AppFeedback f, String status) => _guard(() async {
+        await api.put('/admin/feedback/${f.feedbackId}/status', {'status': status});
+        f.status = status;
+        notifyListeners();
+        await refresh();
+      });
 
   /// ส่งซ่อม / กลับมาให้บริการ (ห้ามตอนมีคนยืม)
-  String? setMaintenance(Vehicle v, bool repair) {
-    if (v.status == VehicleStatus.inUse) return 'Someone is riding this vehicle';
-    if (repair) {
-      v
-        ..batteryLevel = liveBattery(v)
-        ..status = VehicleStatus.maintenance;
-      _chargeFrom.remove(v.vehicleId);
-    } else {
-      v.status = VehicleStatus.available;
-      _chargeFrom[v.vehicleId] = (v.batteryLevel.toDouble(), DateTime.now());
-    }
-    notifyListeners();
-    return null;
-  }
+  Future<String?> setMaintenance(Vehicle v, bool repair) => _guard(() async {
+        await api.put('/admin/vehicles/${v.vehicleId}/maintenance', {'repair': repair});
+        await refresh();
+      });
 
-  int _nextVehicle = 11, _nextStation = 4;
+  /// INSERT INTO vehicles (vehicle_code ต้องไม่ซ้ำ) – รหัส = <prefix>-<เลข 3 หลัก>
+  Future<String?> addVehicle({required VehicleType type, required String number, required Station station}) =>
+      _guard(() async {
+        await api.post('/admin/vehicles', {
+          'type_id': type.typeId,
+          'number': number.trim(),
+          'station_id': station.stationId,
+        });
+        await refresh();
+      });
 
-  /// INSERT INTO vehicles (vehicle_code ต้องไม่ซ้ำ)
-  String? addVehicle({required VehicleType type, required String number, required Station station}) {
-    final n = int.tryParse(number.trim());
-    if (n == null || n <= 0 || n > 999) return 'Enter a number 1–999';
-    final code = '${type.codePrefix}-${n.toString().padLeft(3, '0')}';
-    if (_vehicles.any((v) => v.code == code)) return '$code already exists';
-    if (availability(station).freeDocks <= 0) return '${station.name} is full';
-    final v = Vehicle(
-      vehicleId: _nextVehicle++,
-      code: code,
-      typeId: type.typeId,
-      currentStationId: station.stationId,
-      batteryLevel: 100,
-      status: VehicleStatus.available,
-    );
-    _vehicles.add(v);
-    _chargeFrom[v.vehicleId] = (100, DateTime.now());
-    notifyListeners();
-    return null;
-  }
-
-  String? saveStation(Station? s, {required String name, required int docks, required bool active}) {
-    if (name.trim().isEmpty) return 'Station name is required';
-    if (_stations.any((x) => x != s && x.name.toLowerCase() == name.trim().toLowerCase())) {
-      return 'This name is already used';
-    }
-    if (docks < 1) return 'Docks must be at least 1';
-    if (s == null) {
-      _stations.add(Station(stationId: _nextStation++, name: name.trim(), totalDocks: docks));
-    } else {
-      // ปิดสถานีไม่ได้ ถ้ายังมีคนยืมรถจากที่นี่ (ต้องคืนที่สถานีเดิม)
-      if (!active && _rides.any((r) => r.isOpen && r.startStationId == s.stationId)) {
-        return 'Riders still need to return vehicles here';
-      }
-      final parked = _vehicles.where((v) => v.currentStationId == s.stationId).length;
-      if (docks < parked) return '$parked vehicles are parked here – need at least $parked docks';
-      s
-        ..name = name.trim()
-        ..totalDocks = docks
-        ..isActive = active;
-    }
-    notifyListeners();
-    return null;
-  }
+  /// เพิ่ม (s == null) หรือแก้สถานี
+  Future<String?> saveStation(Station? s, {required String name, required int docks, required bool active}) =>
+      _guard(() async {
+        if (s == null) {
+          await api.post('/admin/stations', {'name': name, 'total_docks': docks});
+        } else {
+          await api.put('/admin/stations/${s.stationId}', {'name': name, 'total_docks': docks, 'is_active': active});
+        }
+        await refresh();
+      });
 
   /// เปลี่ยนรูปสถานี: ไอคอนสำเร็จรูป และ/หรือ รูปถ่าย (ผู้ใช้เห็นทันทีในหน้า Home / เลือกรถ)
-  void setStationLook(Station st, {String? iconKey, Uint8List? photo, bool removePhoto = false}) {
-    if (iconKey != null) st.iconKey = iconKey;
-    if (photo != null) st.photo = photo;
-    if (removePhoto) st.photo = null;
-    notifyListeners();
-  }
+  Future<String?> setStationLook(Station st, {String? iconKey, Uint8List? photo, bool removePhoto = false}) =>
+      _guard(() async {
+        if (iconKey != null && iconKey != st.iconKey) {
+          await api.put('/admin/stations/${st.stationId}', {
+            'name': st.name,
+            'total_docks': st.totalDocks,
+            'is_active': st.isActive,
+            'icon_key': iconKey,
+          });
+        }
+        if (photo != null) {
+          await api.post('/admin/stations/${st.stationId}/photo', {
+            'image_base64': base64Encode(photo),
+            'mime': sniffImageMime(photo),
+          });
+        } else if (removePhoto) {
+          await api.delete('/admin/stations/${st.stationId}/photo');
+        }
+        await refresh();
+      });
 
   /// แก้ชื่อ / รหัสนักศึกษาแทนผู้ใช้ (หน้า Account settings ล็อกไว้)
-  String? updateUser(User u, {required String fullName, required String studentId}) {
-    if (fullName.trim().isEmpty || studentId.trim().isEmpty) return 'Please fill in every field';
-    if (_users.any((x) => x != u && x.studentId == studentId.trim())) {
-      return 'This student ID is already used';
-    }
-    u
-      ..fullName = fullName.trim()
-      ..studentId = studentId.trim();
-    notifyListeners();
-    return null;
-  }
+  Future<String?> updateUser(User u, {required String fullName, required String studentId}) => _guard(() async {
+        await api.put('/admin/users/${u.userId}', {'full_name': fullName, 'student_id': studentId});
+        await refresh();
+      });
 
   /// ระงับ / เปิดบัญชี (users.is_active)
-  String? setUserActive(User u, bool active) {
-    if (!active && _rides.any((r) => r.userId == u.userId && r.isOpen)) {
-      return 'This user still has a vehicle out';
+  Future<String?> setUserActive(User u, bool active) => _guard(() async {
+        await api.put('/admin/users/${u.userId}/active', {'active': active});
+        await refresh();
+      });
+
+  // ================================================================ ดึงข้อมูลจาก backend
+  /// โหลดข้อมูลทั้งหมดที่ role นี้ต้องใช้มาใส่ cache แล้วแจ้งหน้าจอ (เรียกหลังล็อกอิน หลังทุกการแก้ไข และทุก 60 วิ)
+  Future<void> refresh() async {
+    final me = _me;
+    if (me == null) return;
+    final isAdmin = me.isAdmin;
+    final token = api.token;
+
+    final common = await Future.wait<dynamic>([
+      api.getMap('/me'),
+      api.getList('/vehicle-types'),
+      api.getList('/rental-plans'),
+      api.getList(isAdmin ? '/admin/stations' : '/stations'),
+      api.getList('/vehicles'),
+      api.getList(isAdmin ? '/admin/rides' : '/rides'),
+    ]);
+    List<Map<String, dynamic>> txns, users = [], topups = [], reports = [], feedback = [];
+    if (isAdmin) {
+      final a = await Future.wait<dynamic>([
+        api.getList('/admin/users'),
+        api.getList('/admin/topups'),
+        api.getList('/admin/transactions'),
+        api.getList('/admin/reports'),
+        api.getList('/admin/feedback'),
+      ]);
+      users = a[0] as List<Map<String, dynamic>>;
+      topups = a[1] as List<Map<String, dynamic>>;
+      txns = a[2] as List<Map<String, dynamic>>;
+      reports = a[3] as List<Map<String, dynamic>>;
+      feedback = a[4] as List<Map<String, dynamic>>;
+    } else {
+      txns = await api.getList('/credit/transactions');
     }
-    u.isActive = active;
+
+    if (api.token != token || _me == null) return; // ระหว่างรอมีการ logout → ทิ้งผลที่มาถึงช้า
+
+    _applyUser(common[0] as Map<String, dynamic>);
+    _types = (common[1] as List<Map<String, dynamic>>).map(VehicleType.fromJson).toList();
+    _plans = (common[2] as List<Map<String, dynamic>>).map(RentalPlan.fromJson).toList();
+    _syncStations(common[3] as List<Map<String, dynamic>>);
+    _syncVehicles(common[4] as List<Map<String, dynamic>>);
+    _rides = (common[5] as List<Map<String, dynamic>>).map(Ride.fromJson).toList();
+    _txns = txns.map(CreditTransaction.fromJson).toList();
+    if (isAdmin) {
+      for (final j in users) {
+        _applyUser(j);
+      }
+      _topups = topups.map(Topup.fromJson).toList();
+      _reports = reports.map(ProblemReport.fromJson).toList();
+      _feedback = feedback.map(AppFeedback.fromJson).toList();
+    }
     notifyListeners();
-    return null;
   }
 
-  // ================================================================ mock data
-  // คัดลอกจาก ecoride_db.sql (dump วันที่ 7 Nov 2026) ให้หน้าจอเห็นข้อมูลชุดเดียวกับ DB จริง
-  void _seed() {
-    DateTime t(String s) => DateTime.parse(s);
-
-    _stations.addAll([
-      Station(stationId: 1, name: 'Building 1', totalDocks: 10),
-      Station(stationId: 2, name: 'Building 2', totalDocks: 12),
-      Station(stationId: 3, name: 'Building 3', totalDocks: 10),
-    ]);
-    _types.addAll(const [
-      VehicleType(typeId: 1, codePrefix: 'EB', name: 'Electric bicycle'),
-      VehicleType(typeId: 2, codePrefix: 'ES', name: 'Electric scooter'),
-    ]);
-    _plans.add(const RentalPlan(planId: 1, name: '1 day (24 hrs)', durationHours: 24, price: 100));
-
-    void vh(int id, String code, int type, int? st, int bat,
-        [VehicleStatus status = VehicleStatus.available]) {
-      _vehicles.add(Vehicle(
-          vehicleId: id,
-          code: code,
-          typeId: type,
-          currentStationId: st,
-          batteryLevel: bat,
-          status: status));
-      // รถที่จอดอยู่เสียบชาร์จ เริ่มนับจากตอนเปิดแอป
-      if (status == VehicleStatus.available) _chargeFrom[id] = (bat.toDouble(), DateTime.now());
+  /// สร้างหรืออัปเดต User ใน cache (object เดิมถูกแก้ค่าแทนการสร้างใหม่)
+  User _applyUser(Map<String, dynamic> json) {
+    final fresh = User.fromJson(json);
+    final old = _usersById[fresh.userId];
+    final u = old ?? (_usersById[fresh.userId] = fresh);
+    if (old != null) {
+      old
+        ..studentId = fresh.studentId
+        ..username = fresh.username
+        ..fullName = fresh.fullName
+        ..creditBalance = fresh.creditBalance
+        ..isActive = fresh.isActive
+        ..avatarId = fresh.avatarId
+        ..avatarUrl = fresh.avatarUrl;
     }
+    if (_me != null && _me!.userId == u.userId) {
+      _me = u;
+      _ensureImage(u.avatarUrl);
+    } else if (_me == null && json['role'] != null) {
+      _me = u; // ตอน login: ยังไม่มี _me
+      _ensureImage(u.avatarUrl);
+    }
+    return u;
+  }
 
-    vh(1, 'EB-012', 1, 1, 79);
-    vh(2, 'EB-015', 1, 1, 72);
-    vh(3, 'ES-031', 2, 1, 12);
-    vh(4, 'ES-016', 2, 1, 91);
-    vh(5, 'EB-021', 1, 2, 95);
-    vh(6, 'ES-027', 2, null, 54, VehicleStatus.inUse); // ★ Krittin กำลังยืม
-    vh(7, 'ES-022', 2, 2, 80);
-    vh(8, 'EB-004', 1, null, 77, VehicleStatus.inUse); // ★ Malee ยืมเกินเวลา
-    vh(9, 'EB-005', 1, 3, 88);
-    vh(10, 'ES-041', 2, 3, 60);
+  void _syncStations(List<Map<String, dynamic>> rows) {
+    final ids = <int>{};
+    for (final j in rows) {
+      final fresh = Station.fromJson(j);
+      ids.add(fresh.stationId);
+      final old = _stationsById[fresh.stationId];
+      final st = old ?? (_stationsById[fresh.stationId] = fresh);
+      if (old != null) {
+        old
+          ..name = fresh.name
+          ..totalDocks = fresh.totalDocks
+          ..isActive = fresh.isActive
+          ..iconKey = fresh.iconKey;
+        if (old.photoUrl != fresh.photoUrl) {
+          old
+            ..photoUrl = fresh.photoUrl
+            ..photo = null;
+        }
+      }
+      if (st.photoUrl == null) {
+        st.photo = null;
+      } else if (st.photo == null) {
+        final id = st.stationId;
+        _ensureImage(st.photoUrl, (bytes) {
+          final cur = _stationsById[id];
+          if (cur != null && cur.photoUrl == st.photoUrl) cur.photo = bytes;
+        });
+      }
+    }
+    _stationsById.removeWhere((id, _) => !ids.contains(id));
+  }
 
-    // users – password_hash ใน DB ยังเป็น placeholder จึงตั้งรหัสทดลองเป็น password123 ทั้งคู่
-    final me = User(
-        userId: 1,
-        studentId: '6731501118',
-        username: 'somchai.j',
-        fullName: 'Somchai Jaidee',
-        creditBalance: 150);
-    final admin = User(
-        userId: 2,
-        studentId: 'ADMIN0001',
-        username: 'admin',
-        fullName: 'EcoRide Admin',
-        creditBalance: 0,
-        role: 'admin');
-    _users.addAll([me, admin]);
-    _passwords[1] = 'password123';
-    _passwords[2] = 'password123';
-
-    void top(int id, double amt, String created, String paid) => _topups.add(Topup(
-        topupId: id,
-        userId: 1,
-        amount: amt,
-        createdAt: t(created),
-        status: TopupStatus.paid,
-        paidAt: t(paid)));
-    top(1, 100, '2026-10-28 10:00:00', '2026-10-28 10:00:30');
-    top(2, 250, '2026-11-01 10:30:00', '2026-11-01 10:30:30');
-    top(3, 200, '2026-11-04 20:05:00', '2026-11-04 20:05:30');
-
-    void ride(int id, int veh, int st, String start, String due, String end, int b0, int b1) =>
-        _rides.add(Ride(
-            rideId: id,
-            userId: 1,
-            vehicleId: veh,
-            planId: 1,
-            startStationId: st,
-            returnStationId: st,
-            startTime: t(start),
-            dueTime: t(due),
-            endTime: t(end),
-            batteryStart: b0,
-            batteryEnd: b1,
-            pricePaid: 100,
-            status: RideStatus.returned));
-    ride(1, 8, 3, '2026-10-29 08:05:00', '2026-10-30 08:05:00', '2026-10-29 08:41:00', 90, 77);
-    ride(2, 6, 2, '2026-11-03 13:10:00', '2026-11-04 13:10:00', '2026-11-03 14:02:00', 70, 54);
-    ride(3, 1, 1, '2026-11-05 09:42:00', '2026-11-06 09:42:00', '2026-11-05 10:05:00', 92, 86);
-    ride(4, 1, 1, '2026-11-08 01:20:28', '2026-11-09 01:20:28', '2026-11-08 01:22:54', 86, 79);
-
-    void txn(int id, String type, double amt, double bal, int? rideId, int? topupId,
-            String note, String at) =>
-        _txns.add(CreditTransaction(
-            txnId: id,
-            userId: 1,
-            txnType: type,
-            amount: amt,
-            balanceAfter: bal,
-            rideId: rideId,
-            topupId: topupId,
-            note: note,
-            createdAt: t(at)));
-    txn(1, 'topup', 100, 100, null, 1, 'Top up', '2026-10-28 10:00:30');
-    txn(2, 'ride_payment', -100, 0, 1, null, 'Ride EB-004', '2026-10-29 08:05:00');
-    txn(3, 'topup', 250, 250, null, 2, 'Top up', '2026-11-01 10:30:30');
-    txn(4, 'ride_payment', -100, 150, 2, null, 'Ride ES-027', '2026-11-03 13:10:00');
-    txn(5, 'topup', 200, 350, null, 3, 'Top up', '2026-11-04 20:05:30');
-    txn(6, 'ride_payment', -100, 250, 3, null, 'Ride EB-012', '2026-11-05 09:42:00');
-    txn(7, 'ride_payment', -100, 150, 4, null, 'Ride payment', '2026-11-08 01:20:28');
-
-    _reports.add(ProblemReport(
-        reportId: 1,
-        userId: 1,
-        vehicleId: 3,
-        category: ReportCategory.lowBattery,
-        details: 'Battery drains very quickly',
-        createdAt: t('2026-11-08 01:13:18')));
-
-    // ---------------- ★ ข้อมูลเพิ่มเพื่อเดโมหน้า Admin (ไม่มีใน dump)
+  /// รถทั้งหมดจาก GET /vehicles – ตั้งแบตเริ่มต้นให้การจำลองฝั่งแอปจาก live_battery ของ backend
+  void _syncVehicles(List<Map<String, dynamic>> rows) {
+    final ids = <int>{};
     final now = DateTime.now();
-    _users.addAll([
-      User(userId: 3, studentId: '6731502229', username: 'malee.r',
-          fullName: 'Malee Ratanachai', creditBalance: 40),
-      User(userId: 4, studentId: '6731501086', username: 'krittin.w',
-          fullName: 'Krittin Wong', creditBalance: 150),
-    ]);
-    _passwords[3] = 'password123';
-    _passwords[4] = 'password123';
-
-    _topups.addAll([
-      Topup(topupId: 4, userId: 4, amount: 250, createdAt: t('2026-11-02 09:00:00'),
-          status: TopupStatus.paid, paidAt: t('2026-11-02 09:00:40')),
-      // รอแอดมินยืนยัน (เช่น โอนแล้วแต่ระบบยังไม่ตรวจเจอ)
-      Topup(topupId: 5, userId: 3, amount: 200,
-          createdAt: now.subtract(const Duration(minutes: 12))),
-    ]);
-
-    Ride open(int id, int userId, int veh, int st, Duration ago, int b0) {
-      final start = now.subtract(ago);
-      return Ride(
-          rideId: id,
-          userId: userId,
-          vehicleId: veh,
-          planId: 1,
-          startStationId: st,
-          startTime: start,
-          dueTime: start.add(const Duration(hours: 24)),
-          batteryStart: b0,
-          pricePaid: 100);
+    for (final j in rows) {
+      final fresh = Vehicle.fromJson(j);
+      ids.add(fresh.vehicleId);
+      final old = _vehiclesById[fresh.vehicleId];
+      final v = old ?? (_vehiclesById[fresh.vehicleId] = fresh);
+      if (old != null) {
+        old
+          ..currentStationId = fresh.currentStationId
+          ..batteryLevel = fresh.batteryLevel
+          ..status = fresh.status;
+      }
+      final live = j['live_battery'] == null ? v.batteryLevel : (j['live_battery'] as num).toInt();
+      switch (v.status) {
+        case VehicleStatus.available:
+          v.batteryLevel = live;
+          _chargeFrom[v.vehicleId] = (live.toDouble(), now); // จอดชาร์จ: นับต่อจากค่าสดของ backend
+        case VehicleStatus.maintenance:
+          v.batteryLevel = live; // ซ่อมอยู่ไม่ชาร์จ
+          _chargeFrom.remove(v.vehicleId);
+        case VehicleStatus.inUse:
+          _chargeFrom.remove(v.vehicleId); // กำลังขี่: liveBattery() ใช้ batteryStart ของ ride + เวลาที่ผ่านไป
+      }
     }
-
-    _rides.add(open(5, 4, 6, 2, const Duration(minutes: 40), 54));
-    _rides.add(open(6, 3, 8, 3, const Duration(hours: 26), 77)..status = RideStatus.overdue);
-
-    _txns.addAll([
-      CreditTransaction(txnId: 101, userId: 4, txnType: 'topup', amount: 250,
-          balanceAfter: 250, topupId: 4, note: 'Top up', createdAt: t('2026-11-02 09:00:40')),
-      CreditTransaction(txnId: 102, userId: 4, txnType: 'ride_payment', amount: -100,
-          balanceAfter: 150, rideId: 5, note: 'Ride payment',
-          createdAt: now.subtract(const Duration(minutes: 40))),
-      CreditTransaction(txnId: 103, userId: 3, txnType: 'ride_payment', amount: -100,
-          balanceAfter: 40, rideId: 6, note: 'Ride payment',
-          createdAt: now.subtract(const Duration(hours: 26))),
-    ]);
-
-    _reports.add(ProblemReport(
-        reportId: 2,
-        userId: 4,
-        vehicleId: 6,
-        rideId: 5,
-        category: ReportCategory.brakesWheels,
-        details: '[URGENT] Flat tyre · at: in front of Building 2, near the canteen',
-        createdAt: now.subtract(const Duration(minutes: 6))));
-
-    _feedback.addAll([
-      AppFeedback(feedbackId: 1, userId: 3, topic: FeedbackTopic.payment,
-          message: 'I paid by QR but my credit took a long time to show up.',
-          createdAt: now.subtract(const Duration(hours: 3))),
-      AppFeedback(feedbackId: 2, userId: 1, topic: FeedbackTopic.suggestion,
-          message: 'Could you add a station near the library?',
-          createdAt: t('2026-11-07 18:20:00'), status: 'read'),
-    ]);
-
-    // id ถัดไป (เหมือน AUTO_INCREMENT)
-    _nextUser = 5;
-    _nextRide = 7;
-    _nextTopup = 6;
-    _nextTxn = 8; // (★ ใช้เลข 101+ จะได้ไม่ชนกัน)
-    _nextReport = 3;
-    _nextFeedback = 3;
+    _vehiclesById.removeWhere((id, _) => !ids.contains(id));
+    _chargeFrom.removeWhere((id, _) => !ids.contains(id));
   }
 }

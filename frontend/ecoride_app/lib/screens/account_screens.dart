@@ -34,9 +34,10 @@ class _AccountSettingsScreenState extends State<AccountSettingsScreen> {
 
   /// ข้อมูลส่วนตัว (ชื่อ, รหัสนักศึกษา, username) แก้ไม่ได้ – ผูกกับทะเบียนนักศึกษา
   /// หน้านี้เปลี่ยนได้แค่รหัสผ่าน
-  void _save() {
+  Future<void> _save() async {
     final err =
-        AppStore.instance.changePassword(_current.text, _pass.text, _confirm.text);
+        await AppStore.instance.changePassword(_current.text, _pass.text, _confirm.text);
+    if (!mounted) return;
     if (err != null) return toast(context, err, error: true);
     toast(context, 'Password updated');
     Navigator.of(context).pop();
@@ -133,8 +134,9 @@ class _FeedbackScreenState extends State<FeedbackScreen> {
     super.dispose();
   }
 
-  void _send() {
-    final err = AppStore.instance.submitFeedback(topic: _topic, message: _message.text);
+  Future<void> _send() async {
+    final err = await AppStore.instance.submitFeedback(topic: _topic, message: _message.text);
+    if (!mounted) return;
     if (err != null) return toast(context, err, error: true);
     toast(context, 'Thanks! Our team will look into it.');
     Navigator.of(context).pop();
@@ -232,7 +234,10 @@ class _AddCreditScreenState extends State<AddCreditScreen> {
 
   /// สร้างคำขอเติมเงิน (topups) → จ่าย QR → sp_confirm_topup
   /// ตอนนี้จำลองว่าจ่ายสำเร็จทันที (ตัวจริง: รอระบบจ่ายเงิน/แอดมินยืนยัน)
-  void _topUp() {
+  bool _busy = false; // กันกดซ้ำระหว่างรอ backend
+
+  Future<void> _topUp() async {
+    if (_busy) return;
     final amt = _amount;
     if (amt < AppStore.minTopup) {
       return toast(context, 'Minimum top-up is ${baht(AppStore.minTopup)}', error: true);
@@ -241,8 +246,12 @@ class _AddCreditScreenState extends State<AddCreditScreen> {
       return toast(context, 'Maximum top-up is ${baht(AppStore.maxTopup)} per time', error: true);
     }
     final store = AppStore.instance;
-    final t = store.createTopup(amt);
-    final err = store.confirmTopup(t);
+    _busy = true;
+    final (t, createErr) = await store.createTopup(amt);
+    // ยังไม่มีระบบจ่ายเงินจริง: backend ให้ผู้ใช้ยืนยันรายการของตัวเองได้ (ALLOW_SELF_CONFIRM_TOPUP)
+    final err = t == null ? createErr : await store.confirmTopup(t);
+    _busy = false;
+    if (!mounted) return;
     if (err != null) return toast(context, err, error: true);
     toast(context, '${baht(amt)} added to your credit');
     Navigator.of(context).pop();

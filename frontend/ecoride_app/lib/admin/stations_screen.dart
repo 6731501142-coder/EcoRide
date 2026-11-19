@@ -310,16 +310,24 @@ Future<void> editStation(BuildContext context, Station? st) async {
               onPressed: () => Navigator.pop(ctx),
               child: Text('Cancel', style: ts(11, color: C.chipText))),
           TextButton(
-            onPressed: () {
+            onPressed: () async {
               final store = AppStore.instance;
-              final err = store.saveStation(st,
+              final err = await store.saveStation(st,
                   name: name.text, docks: int.tryParse(docks.text) ?? 0, active: active);
+              if (!context.mounted) return;
               if (err != null) return toast(context, err, error: true);
-              // สถานีใหม่ = ตัวสุดท้ายในรายการ
-              final target = st ?? store.allStations.last;
-              store.setStationLook(target,
-                  iconKey: iconKey, photo: photo, removePhoto: removePhoto);
+              // สถานีใหม่ = หาจากชื่อที่เพิ่งบันทึก
+              final target = st ??
+                  store.allStations.firstWhere((x) => x.name == name.text.trim(),
+                      orElse: () => store.allStations.last);
+              // ส่งรูปขึ้น backend เฉพาะตอนเลือกรูปใหม่ (รูปเดิมที่โหลดมาแสดงไม่ต้องอัปโหลดซ้ำ)
+              final lookErr = await store.setStationLook(target,
+                  iconKey: iconKey,
+                  photo: identical(photo, target.photo) ? null : photo,
+                  removePhoto: removePhoto);
+              if (!context.mounted) return;
               Navigator.pop(ctx);
+              if (lookErr != null) return toast(context, lookErr, error: true);
               toast(context, st == null ? 'Station added' : 'Station saved');
             },
             child: Text('Save', style: ts(11, w: FontWeight.w600, color: C.red)),

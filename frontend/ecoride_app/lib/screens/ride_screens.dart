@@ -291,9 +291,10 @@ class PaymentConfirmScreen extends StatelessWidget {
   final Vehicle vehicle;
 
   /// ปุ่ม Confirm = sp_borrow_vehicle → สำเร็จแล้วไปหน้า Summary
-  void _confirm(BuildContext context) {
+  Future<void> _confirm(BuildContext context) async {
     final store = AppStore.instance;
-    final (ride, err) = store.borrow(vehicle, store.defaultPlan);
+    final (ride, err) = await store.borrow(vehicle, store.defaultPlan);
+    if (!context.mounted) return;
     if (ride == null) return toast(context, err!, error: true);
     toast(context, 'Enjoy your ride! Return by ${hm(ride.dueTime)} tomorrow.');
     _backToHomeThen(context, const RideSummaryScreen());
@@ -535,8 +536,9 @@ class ReturnStationScreen extends StatelessWidget {
   final Ride ride;
 
   /// ปุ่ม Confirm return = sp_return_vehicle
-  void _confirm(BuildContext context, Station s) {
-    final err = AppStore.instance.returnVehicle(ride, s);
+  Future<void> _confirm(BuildContext context, Station s) async {
+    final err = await AppStore.instance.returnVehicle(ride, s);
+    if (!context.mounted) return;
     if (err != null) return toast(context, err, error: true);
     toast(context, 'Returned at ${s.name}. Thank you!');
     _backToHomeThen(context);
